@@ -34,6 +34,7 @@
 #include "assert.hpp"
 #include "ioctl.h"
 #include "umd/device/arch/architecture_implementation.hpp"
+#include "umd/device/pcie/silicon_tlb_window.hpp"
 #include "umd/device/tt_kmd_lib/tt_kmd_lib.h"
 #include "umd/device/types/arch.hpp"
 #include "umd/device/utils/common.hpp"
@@ -797,29 +798,20 @@ std::unique_ptr<TlbHandle> PCIDevice::allocate_tlb(const size_t tlb_size, const 
 }
 
 void PCIDevice::configure_tlb(const uint32_t tlb_index, const tlb_data &tlb_config) {
-    // Get the TLB configuration for this index.
     auto tlb_configuration = arch_impl_->get_tlb_configuration(tlb_index);
-
-    // Apply the architecture-specific bit field offsets to pack the TLB data.
     auto [lower_64, upper_64] = tlb_config.apply_offset(tlb_configuration.offset);
 
-    // Calculate the register address for this TLB index using architecture-specific register size.
     const uint64_t tlb_cfg_reg_size_bytes = arch_impl_->get_tlb_cfg_reg_size_bytes();
     uint64_t tlb_register_addr = tlb_index * tlb_cfg_reg_size_bytes;
 
-    // Write to the appropriate location in BAR0.
-    volatile uint64_t *tlb_reg_ptr =
-        reinterpret_cast<volatile uint64_t *>(static_cast<char *>(tlb_config_space) + tlb_register_addr);
+    void *tlb_reg_ptr = static_cast<char *>(tlb_config_space) + tlb_register_addr;
 
-    // Write the TLB register values
-    // Wormhole uses 64-bit registers (8 bytes), Blackhole uses 96-bit registers (12 bytes).
-    tlb_reg_ptr[0] = lower_64;
+    SiliconTlbWindow::memcpy_to_device(tlb_reg_ptr, &lower_64, sizeof(lower_64));
 
     if (arch == tt::ARCH::BLACKHOLE) {
-        // Blackhole needs the upper 32 bits as well (96-bit total)
-        // Cast to uint32_t* to write only 4 bytes and avoid overwriting the next register.
-        volatile uint32_t *tlb_reg_upper_ptr = reinterpret_cast<volatile uint32_t *>(tlb_reg_ptr);
-        tlb_reg_upper_ptr[2] = static_cast<uint32_t>(upper_64);  // Write to bytes 8-11
+        uint32_t upper_32 = static_cast<uint32_t>(upper_64);
+        void *tlb_reg_upper_ptr = static_cast<char *>(tlb_reg_ptr) + sizeof(lower_64);
+        SiliconTlbWindow::memcpy_to_device(tlb_reg_upper_ptr, &upper_32, sizeof(upper_32));
     }
 
     log_trace(

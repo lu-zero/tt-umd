@@ -49,10 +49,6 @@ namespace tt::umd {
 // reset_m3 flag sends specific ARC message to do a M3 board level reset
 bool WarmReset::warm_reset(
     std::vector<int> pci_device_ids, bool reset_m3, bool secondary_bus_reset, std::chrono::milliseconds m3_delay) {
-    if constexpr (utils::is_arm_platform()) {
-        log_warning(tt::LogUMD, "Warm reset is disabled on ARM platforms due to instability. Skipping reset.");
-        return false;
-    }
     // If pci_device_ids is empty, enumerate all devices.
     if (pci_device_ids.empty()) {
         pci_device_ids = PCIDevice::enumerate_devices();

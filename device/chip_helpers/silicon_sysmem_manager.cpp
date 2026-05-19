@@ -37,12 +37,22 @@
 
 namespace tt::umd {
 
-// Try to mmap with 1GB hugepages first, then 2MB hugepages, then regular pages.
-// This is a performance optimization: hugepages reduce page fault overhead during allocation.
-// All three options are functionally correct when IOMMU is enabled.
+// Try to mmap with the largest available hugepage size, falling back to smaller sizes and
+// finally regular pages.  Larger hugepages reduce IOMMU/SMMU TLB pressure during DMA.
+//
+// Priority order reflects hardware support:
+//   1GB  — x86 PUD block; not available on AArch64 with 64K base pages.
+//  512MB — AArch64 64K-page PMD block: single SMMU TLB entry per 512MB (best on this platform).
+//    2MB — x86 PMD block / AArch64 64K-page contiguous PTE (32 × 64K with contiguous bit).
+//
+// On AArch64 with 64K base pages, pre-allocate 512MB hugepages for optimal SMMU coverage:
+//   echo <N> > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages  (N = size / 512MB)
+// or persistently: hugepagesz=512M hugepages=<N> on the kernel command line.
+// Fallback: 2MB hugepages (echo <N> > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages).
 static void *mmap_with_hugepage_fallback(size_t size) {
-    constexpr size_t kHugepage1GiB = 1ULL << 30;
-    constexpr size_t kHugepage2MiB = 2ULL << 20;
+    constexpr size_t kHugepage1GiB   = 1ULL << 30;
+    constexpr size_t kHugepage512MiB = 512ULL << 20;
+    constexpr size_t kHugepage2MiB   = 2ULL << 20;
 
     void *addr = MAP_FAILED;
 
@@ -57,6 +67,22 @@ static void *mmap_with_hugepage_fallback(size_t size) {
             0);
         if (addr != MAP_FAILED) {
             log_debug(LogUMD, "Allocated {:#x} bytes using 1GB hugepages.", size);
+            return addr;
+        }
+    }
+
+    // 512MiB hugepages: PMD block on AArch64 with 64K base pages.
+    // Each entry covers 512MB with a single SMMU TLB entry — optimal for this platform.
+    if (size >= kHugepage512MiB && (size % kHugepage512MiB) == 0) {
+        addr = mmap(
+            nullptr,
+            size,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_512MB | MAP_POPULATE,
+            -1,
+            0);
+        if (addr != MAP_FAILED) {
+            log_debug(LogUMD, "Allocated {:#x} bytes using 512MB hugepages.", size);
             return addr;
         }
     }
@@ -78,7 +104,20 @@ static void *mmap_with_hugepage_fallback(size_t size) {
 
     addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (addr != MAP_FAILED) {
-        log_debug(LogUMD, "Allocated {:#x} bytes using regular pages.", size);
+        // All hugepage attempts failed; regular pages will work but cause more IOMMU/SMMU TLB
+        // pressure during DMA, reducing H2D bandwidth.
+        // On AArch64 with 64K base pages, pre-allocate 512MB hugepages (PMD blocks):
+        //   echo {} > /sys/kernel/mm/hugepages/hugepages-524288kB/nr_hugepages
+        // or 2MB hugepages (contiguous PTEs):
+        //   echo {} > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+        log_warning(
+            LogUMD,
+            "Sysmem ({:#x} bytes) allocated with regular pages; hugepage allocation failed. "
+            "For better H2D DMA performance pre-allocate hugepages "
+            "(e.g. {} × 512MB or {} × 2MB).",
+            size,
+            (size + kHugepage512MiB - 1) / kHugepage512MiB,
+            (size + kHugepage2MiB - 1) / kHugepage2MiB);
     }
     return addr;
 }
@@ -388,7 +427,7 @@ bool SiliconSysmemManager::pin_or_map_iommu() {
         UMD_THROW(error::RuntimeError, "Proceeding could lead to undefined behavior");
     }
 
-    log_info(LogUMD, "Mapped sysmem without hugepages to IOVA {:#x}; NOC address {:#x}", iova, *noc_address);
+    log_info(LogUMD, "Mapped sysmem via IOMMU to IOVA {:#x}; NOC address {:#x}", iova, *noc_address);
 
     for (size_t ch = 0; ch < hugepage_mapping_per_channel.size(); ch++) {
         uint64_t device_io_address = iova + ch * HUGEPAGE_REGION_SIZE;
